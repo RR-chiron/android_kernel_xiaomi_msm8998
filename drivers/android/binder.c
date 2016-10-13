@@ -178,7 +178,6 @@ struct binder_stats {
 	atomic_t bc[_IOC_NR(BC_REPLY_SG) + 1];
 	atomic_t obj_created[BINDER_STAT_COUNT];
 	atomic_t obj_deleted[BINDER_STAT_COUNT];
-	atomic_t obj_zombie[BINDER_STAT_COUNT];
 };
 
 static struct binder_stats binder_stats;
@@ -191,17 +190,6 @@ static inline void binder_stats_deleted(enum binder_stat_types type)
 static inline void binder_stats_created(enum binder_stat_types type)
 {
 	atomic_inc(&binder_stats.obj_created[type]);
-}
-
-static inline void binder_stats_zombie(enum binder_stat_types type)
-{
-	atomic_inc(&binder_stats.obj_zombie[type]);
-}
-
-static inline void binder_stats_delete_zombie(enum binder_stat_types type)
-{
-	atomic_dec(&binder_stats.obj_zombie[type]);
-	binder_stats_deleted(type);
 }
 
 struct binder_transaction_log_entry {
@@ -4483,14 +4471,12 @@ static void print_binder_stats(struct seq_file *m, const char *prefix,
 	for (i = 0; i < ARRAY_SIZE(stats->obj_created); i++) {
 		int created = atomic_read(&stats->obj_created[i]);
 		int deleted = atomic_read(&stats->obj_deleted[i]);
-		int zombie = atomic_read(&stats->obj_zombie[i]);
 
-		if (created || deleted || zombie)
-			seq_printf(m, "%s%s: active %d zombie %d total %d\n",
+		if (created || deleted)
+			seq_printf(m, "%s%s: active %d total %d\n",
 				prefix,
 				binder_objstat_strings[i],
-				created - deleted - zombie,
-				zombie,
+				created - deleted,
 				created);
 	}
 }
