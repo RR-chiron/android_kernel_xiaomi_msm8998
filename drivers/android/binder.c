@@ -383,7 +383,6 @@ enum {
 	BINDER_LOOPER_STATE_EXITED      = 0x04,
 	BINDER_LOOPER_STATE_INVALID     = 0x08,
 	BINDER_LOOPER_STATE_WAITING     = 0x10,
-	BINDER_LOOPER_STATE_POLL        = 0x20,
 };
 
 struct binder_thread {
@@ -2801,37 +2800,13 @@ static void binder_stat_br(struct binder_proc *proc,
 static int binder_wait_for_work(struct binder_thread *thread,
 				bool do_proc_work)
 {
-	DEFINE_WAIT(wait);
-	struct binder_proc *proc = thread->proc;
-	struct binder_thread *get_thread;
-	int ret = 0;
+	return !list_empty(&proc->todo) || thread->looper_need_return;
+}
 
-	binder_put_thread(thread);
-	freezer_do_not_count();
-	binder_proc_lock(proc, __LINE__);
-	for (;;) {
-		prepare_to_wait(&thread->wait, &wait, TASK_INTERRUPTIBLE);
-		if (binder_has_work(thread, do_proc_work))
-			break;
-		if (do_proc_work)
-			list_add(&thread->waiting_thread_node,
-				 &proc->waiting_threads);
-		binder_proc_unlock(proc, __LINE__);
-		schedule();
-		binder_proc_lock(proc, __LINE__);
-		list_del_init(&thread->waiting_thread_node);
-		if (signal_pending(current)) {
-			ret = -ERESTARTSYS;
-			break;
-		}
-	}
-	finish_wait(&thread->wait, &wait);
-	binder_proc_unlock(proc, __LINE__);
-	freezer_count();
-	get_thread = binder_get_thread(proc);
-	BUG_ON(get_thread != thread);
-
-	return ret;
+static int binder_has_thread_work(struct binder_thread *thread)
+{
+	return !list_empty(&thread->todo) || thread->return_error != BR_OK ||
+		thread->looper_need_return;
 }
 
 static int binder_put_node_cmd(struct binder_proc *proc,
@@ -2953,8 +2928,14 @@ retry:
 			w = list_first_entry(&thread->todo.list,
 					     struct binder_work,
 					     entry);
-			wlist = &thread->todo;
-			binder_freeze_worklist(wlist);
+		} else if (!list_empty(&proc->todo) && wait_for_proc_work) {
+			w = list_first_entry(&proc->todo, struct binder_work,
+					     entry);
+		} else {
+			/* no data added */
+			if (ptr - buffer == 4 && !thread->looper_need_return)
+				goto retry;
+			break;
 		}
 		spin_unlock(&thread->todo.lock);
 		if (!w) {
@@ -3398,43 +3379,15 @@ static struct binder_thread *binder_get_thread(struct binder_proc *proc)
 		if (thread == NULL)
 			return NULL;
 		binder_stats_created(BINDER_STAT_THREAD);
-		new_thread->proc = proc;
-		new_thread->pid = current->pid;
-		init_waitqueue_head(&new_thread->wait);
-		binder_init_worklist(&new_thread->todo);
-		WRITE_ONCE(new_thread->looper_need_return, true);
-		new_thread->return_error = BR_OK;
-		new_thread->return_error2 = BR_OK;
-		INIT_LIST_HEAD(&new_thread->active_node.list_node);
-		INIT_LIST_HEAD(&new_thread->waiting_thread_node);
-		get_task_struct(current);
-		new_thread->task = current;
-
-		binder_proc_lock(proc, __LINE__);
-		/*
-		 * Since we gave up the proc lock, we need
-		 * to recalc the insertion point in the rb tree.
-		 */
-		p = &proc->threads.rb_node;
-		while (*p) {
-			parent = *p;
-			thread = rb_entry(parent,
-					  struct binder_thread, rb_node);
-
-			if (current->pid < thread->pid)
-				p = &(*p)->rb_left;
-			else if (current->pid > thread->pid)
-				p = &(*p)->rb_right;
-			else
-				break;
-		}
-		/* This thread can't have been added */
-		BUG_ON(*p != NULL);
-
-		rb_link_node(&new_thread->rb_node, parent, p);
-		rb_insert_color(&new_thread->rb_node, &proc->threads);
-		thread = new_thread;
-		binder_proc_unlock(proc, __LINE__);
+		thread->proc = proc;
+		thread->pid = current->pid;
+		init_waitqueue_head(&thread->wait);
+		INIT_LIST_HEAD(&thread->todo);
+		rb_link_node(&thread->rb_node, parent, p);
+		rb_insert_color(&thread->rb_node, &proc->threads);
+		thread->looper_need_return = true;
+		thread->return_error = BR_OK;
+		thread->return_error2 = BR_OK;
 	}
 	/*
 	 * Add to active threads
@@ -3786,13 +3739,9 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 	ret = 0;
 err:
-	if (thread) {
-		binder_proc_lock(thread->proc, __LINE__);
-		WRITE_ONCE(thread->looper_need_return, false);
-		binder_proc_unlock(thread->proc, __LINE__);
-		binder_put_thread(thread);
-		zombie_cleanup_check(proc);
-	}
+	if (thread)
+		thread->looper_need_return = false;
+	binder_unlock(__func__);
 	wait_event_interruptible(binder_user_error_wait, binder_stop_on_user_error < 2);
 	if (ret && ret != -ERESTARTSYS)
 		pr_info("%d:%d ioctl %x %lx returned %d\n", proc->pid, current->pid, cmd, arg, ret);
@@ -3962,9 +3911,10 @@ static void binder_deferred_flush(struct binder_proc *proc)
 		for (n = rb_first(&proc->threads); n != NULL; n = rb_next(n)) {
 			struct binder_thread *thread;
 
-			thread = rb_entry(n, struct binder_thread, rb_node);
-			if (thread->looper & BINDER_LOOPER_STATE_WAITING)
-				count++;
+		thread->looper_need_return = true;
+		if (thread->looper & BINDER_LOOPER_STATE_WAITING) {
+			wake_up_interruptible(&thread->wait);
+			wake_count++;
 		}
 		binder_proc_unlock(proc, __LINE__);
 
@@ -4327,11 +4277,9 @@ static void _print_binder_thread(struct seq_file *m,
 	size_t start_pos = m->count;
 	size_t header_pos;
 
-	BUG_ON(!spin_is_locked(&thread->proc->proc_lock));
-
 	seq_printf(m, "  thread %d: l %02x need_return %d\n",
 			thread->pid, thread->looper,
-			READ_ONCE(thread->looper_need_return));
+			thread->looper_need_return);
 	header_pos = m->count;
 	t = thread->transaction_stack;
 	while (t) {
