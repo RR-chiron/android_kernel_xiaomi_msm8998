@@ -1137,15 +1137,8 @@ static void binder_pop_transaction(struct binder_thread *target_thread,
 				   struct binder_transaction *t)
 {
 	BUG_ON(!target_thread);
-	BUG_ON(!spin_is_locked(&target_thread->proc->proc_lock));
-
 	BUG_ON(target_thread->transaction_stack != t);
-	/*
-	 * It is possible that the target_thread has died so
-	 * transaction_stack->from could already be NULL
-	 */
-	BUG_ON(target_thread->transaction_stack->from &&
-	       target_thread->transaction_stack->from != target_thread);
+	BUG_ON(target_thread->transaction_stack->from != target_thread);
 	target_thread->transaction_stack =
 		target_thread->transaction_stack->from_parent;
 	t->from = NULL;
@@ -1153,7 +1146,6 @@ static void binder_pop_transaction(struct binder_thread *target_thread,
 
 static void binder_free_transaction(struct binder_transaction *t)
 {
-	t->need_reply = 0;
 	if (t->buffer)
 		t->buffer->transaction = NULL;
 	kfree(t);
@@ -2220,11 +2212,7 @@ static void binder_transaction(struct binder_proc *proc,
 		BUG_ON(t->buffer->async_transaction != 0);
 		binder_proc_lock(target_thread->proc, __LINE__);
 		binder_pop_transaction(target_thread, in_reply_to);
-		binder_enqueue_work(&t->work, target_list, __LINE__);
-		binder_proc_unlock(target_thread->proc, __LINE__);
 		binder_free_transaction(in_reply_to);
-		wake_up_interruptible_sync(target_wait);
-		binder_restore_priority(&saved_priority);
 	} else if (!(t->flags & TF_ONE_WAY)) {
 		BUG_ON(t->buffer->async_transaction != 0);
 		binder_proc_lock(thread->proc, __LINE__);
@@ -3267,9 +3255,7 @@ static void binder_release_work(struct binder_worklist *wlist)
 				binder_debug(BINDER_DEBUG_DEAD_TRANSACTION,
 					"undelivered transaction %d\n",
 					t->debug_id);
-				t->buffer->transaction = NULL;
-				kfree(t);
-				binder_stats_deleted(BINDER_STAT_TRANSACTION);
+				binder_free_transaction(t);
 			}
 		} break;
 		case BINDER_WORK_TRANSACTION_COMPLETE: {
