@@ -4638,21 +4638,8 @@ static int cleared_nodes;
 static int cleared_threads;
 static int cleared_procs;
 
-static bool binder_proc_clear_zombies(struct binder_proc *proc)
-{
-	struct binder_node *node;
-	struct hlist_node *tmp;
-	struct binder_thread *thread;
-	struct binder_ref *ref;
-	struct hlist_head nodes_to_free;
-	struct hlist_head threads_to_free;
-	struct hlist_head refs_to_free;
-	bool needs_requeue = false;
-	struct files_struct *files;
-
-	INIT_HLIST_HEAD(&nodes_to_free);
-	INIT_HLIST_HEAD(&threads_to_free);
-	INIT_HLIST_HEAD(&refs_to_free);
+		/* Transaction should already have been freed */
+		BUG_ON(buffer->transaction);
 
 	binder_proc_lock(proc, __LINE__);
 	if (!list_empty(&proc->zombie_proc.list_node)) {
