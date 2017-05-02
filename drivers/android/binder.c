@@ -1003,13 +1003,12 @@ static struct binder_ref *binder_get_ref_for_node(struct binder_proc *proc,
 	}
 	rb_link_node(&new_ref->rb_node_desc, parent, p);
 	rb_insert_color(&new_ref->rb_node_desc, &proc->refs_by_desc);
-	binder_proc_unlock(proc, __LINE__);
-	smp_mb();
-	/*
-	 * complete the implicit weak inc_ref by incrementing
-	 * the node.
-	 */
-	binder_inc_node(new_ref->node, 0, 1, target_list, __LINE__);
+	hlist_add_head(&new_ref->node_entry, &node->refs);
+
+	binder_debug(BINDER_DEBUG_INTERNAL_REFS,
+		     "%d new ref %d desc %d for node %d\n",
+		      proc->pid, new_ref->debug_id, new_ref->desc,
+		      node->debug_id);
 	return new_ref;
 }
 
