@@ -311,22 +311,51 @@ struct binder_ref_death {
 	struct binder_proc *wait_proc;
 };
 
+/**
+ * struct binder_ref_data - binder_ref counts and id
+ * @debug_id:        unique ID for the ref
+ * @desc:            unique userspace handle for ref
+ * @strong:          strong ref count (debugging only if not locked)
+ * @weak:            weak ref count (debugging only if not locked)
+ *
+ * Structure to hold ref count and ref id information. Since
+ * the actual ref can only be accessed with a lock, this structure
+ * is used to return information about the ref to callers of
+ * ref inc/dec functions.
+ */
+struct binder_ref_data {
+	int debug_id;
+	uint32_t desc;
+	int strong;
+	int weak;
+};
+
+/**
+ * struct binder_ref - struct to track references on nodes
+ * @data:        binder_ref_data containing id, handle, and current refcounts
+ * @rb_node_desc: node for lookup by @data.desc in proc's rb_tree
+ * @rb_node_node: node for lookup by @node in proc's rb_tree
+ * @node_entry:  list entry for node->refs list in target node
+ * @proc:        binder_proc containing ref
+ * @node:        binder_node of target node. When cleaning up a
+ *               ref for deletion in binder_cleanup_ref, a non-NULL
+ *               @node indicates the node must be freed
+ * @death:       pointer to death notification (ref_death) if requested
+ *
+ * Structure to track references from procA to target node (on procB). This
+ * structure is unsafe to access without holding @proc->outer_lock.
+ */
 struct binder_ref {
 	/* Lookups needed: */
 	/*   node + proc => ref (transaction) */
 	/*   desc + proc => ref (transaction, inc/dec ref) */
 	/*   node => refs + procs (proc exit) */
-	int debug_id;
+	struct binder_ref_data data;
 	struct rb_node rb_node_desc;
 	struct rb_node rb_node_node;
 	struct hlist_node node_entry;
 	struct binder_proc *proc;
 	struct binder_node *node;
-	uint32_t desc;
-	atomic_t strong;
-	atomic_t weak;
-	bool is_zombie;
-	struct hlist_node zombie_ref;
 	struct binder_ref_death *death;
 };
 
@@ -761,11 +790,11 @@ static struct binder_ref *binder_get_ref(struct binder_proc *proc,
 	while (n) {
 		ref = rb_entry(n, struct binder_ref, rb_node_desc);
 
-		if (desc < ref->desc) {
+		if (desc < ref->data.desc) {
 			n = n->rb_left;
-		} else if (desc > ref->desc) {
+		} else if (desc > ref->data.desc) {
 			n = n->rb_right;
-		} else if (need_strong_ref && !atomic_read(&ref->strong)) {
+		} else if (need_strong_ref && !ref->data.strong) {
 			binder_user_error("tried to use weak ref as strong ref\n");
 			binder_proc_unlock(proc, __LINE__);
 			return NULL;
@@ -790,16 +819,33 @@ static struct binder_ref *binder_get_ref(struct binder_proc *proc,
 	return NULL;
 }
 
+/**
+ * binder_get_ref_for_node() - get the ref associated with given node
+ * @proc:	binder_proc that owns the ref
+ * @node:	binder_node of target
+ * @new_ref:	newly allocated binder_ref to be initialized or %NULL
+ *
+ * Look up the ref for the given node and return it if it exists
+ *
+ * If it doesn't exist and the caller provides a newly allocated
+ * ref, initialize the fields of the newly allocated ref and insert
+ * into the given proc rb_trees and node refs list.
+ *
+ * Return:	the ref for node. It is possible that another thread
+ *		allocated/initialized the ref first in which case the
+ *		returned ref would be different than the passed-in
+ *		new_ref. new_ref must be kfree'd by the caller in
+ *		this case.
+ */
 static struct binder_ref *binder_get_ref_for_node(struct binder_proc *proc,
-					struct binder_node *node,
-					struct binder_worklist *target_list)
+						  struct binder_node *node,
+						  struct binder_ref *new_ref)
 {
-	struct rb_node *n;
+	struct binder_context *context = proc->context;
 	struct rb_node **p = &proc->refs_by_node.rb_node;
 	struct rb_node *parent = NULL;
-	struct binder_ref *ref, *new_ref;
-	struct binder_context *context = proc->context;
-	struct binder_proc *node_proc = node->proc;
+	struct binder_ref *ref;
+	struct rb_node *n;
 
 	binder_proc_lock(proc, __LINE__);
 	while (*p) {
@@ -816,12 +862,11 @@ static struct binder_ref *binder_get_ref_for_node(struct binder_proc *proc,
 			return ref;
 		}
 	}
-	new_ref = kzalloc(sizeof(*ref), GFP_KERNEL);
-	if (new_ref == NULL)
+	if (!new_ref)
 		return NULL;
 
 	binder_stats_created(BINDER_STAT_REF);
-	new_ref->debug_id = atomic_inc_return(&binder_last_id);
+	new_ref->data.debug_id = atomic_inc_return(&binder_last_id);
 	new_ref->proc = proc;
 	new_ref->node = node;
 	atomic_set(&new_ref->strong, 0);
@@ -895,12 +940,12 @@ static struct binder_ref *binder_get_ref_for_node(struct binder_proc *proc,
 	rb_link_node(&new_ref->rb_node_node, parent, p);
 	rb_insert_color(&new_ref->rb_node_node, &proc->refs_by_node);
 
-	new_ref->desc = (node == context->binder_context_mgr_node) ? 0 : 1;
+	new_ref->data.desc = (node == context->binder_context_mgr_node) ? 0 : 1;
 	for (n = rb_first(&proc->refs_by_desc); n != NULL; n = rb_next(n)) {
 		ref = rb_entry(n, struct binder_ref, rb_node_desc);
-		if (ref->desc > new_ref->desc)
+		if (ref->data.desc > new_ref->data.desc)
 			break;
-		new_ref->desc = ref->desc + 1;
+		new_ref->data.desc = ref->data.desc + 1;
 	}
 
 	p = &proc->refs_by_desc.rb_node;
@@ -908,9 +953,9 @@ static struct binder_ref *binder_get_ref_for_node(struct binder_proc *proc,
 		parent = *p;
 		ref = rb_entry(parent, struct binder_ref, rb_node_desc);
 
-		if (new_ref->desc < ref->desc)
+		if (new_ref->data.desc < ref->data.desc)
 			p = &(*p)->rb_left;
-		else if (new_ref->desc > ref->desc)
+		else if (new_ref->data.desc > ref->data.desc)
 			p = &(*p)->rb_right;
 		else
 			BUG();
@@ -921,18 +966,18 @@ static struct binder_ref *binder_get_ref_for_node(struct binder_proc *proc,
 
 	binder_debug(BINDER_DEBUG_INTERNAL_REFS,
 		     "%d new ref %d desc %d for node %d\n",
-		      proc->pid, new_ref->debug_id, new_ref->desc,
+		      proc->pid, new_ref->data.debug_id, new_ref->data.desc,
 		      node->debug_id);
 	return new_ref;
 }
 
-static void binder_delete_ref(struct binder_ref *ref, bool force, int line)
+static void binder_cleanup_ref(struct binder_ref *ref)
 {
 	struct binder_proc *node_proc = ref->node->proc;
 
 	binder_debug(BINDER_DEBUG_INTERNAL_REFS,
 		     "%d delete ref %d desc %d for node %d\n",
-		      ref->proc->pid, ref->debug_id, ref->desc,
+		      ref->proc->pid, ref->data.debug_id, ref->data.desc,
 		      ref->node->debug_id);
 
 	binder_proc_lock(ref->proc, __LINE__);
@@ -952,88 +997,251 @@ static void binder_delete_ref(struct binder_ref *ref, bool force, int line)
 	ref->is_zombie = true;
 	rb_erase(&ref->rb_node_desc, &ref->proc->refs_by_desc);
 	rb_erase(&ref->rb_node_node, &ref->proc->refs_by_node);
+
+	if (ref->data.strong)
+		binder_dec_node(ref->node, 1, 1);
+
+	hlist_del(&ref->node_entry);
+	binder_dec_node(ref->node, 0, 1);
+
 	if (ref->death) {
 		binder_debug(BINDER_DEBUG_DEAD_BINDER,
 			     "%d delete ref %d desc %d has death notification\n",
-			      ref->proc->pid, ref->debug_id, ref->desc);
-		if (ref->death->work.wlist)
-			binder_dequeue_work(&ref->death->work, __LINE__);
-		binder_stats_zombie(BINDER_STAT_DEATH);
+			      ref->proc->pid, ref->data.debug_id,
+			      ref->data.desc);
+		list_del(&ref->death->work.entry);
+		binder_stats_deleted(BINDER_STAT_DEATH);
 	}
-	INIT_HLIST_NODE(&ref->zombie_ref);
-	hlist_add_head(&ref->zombie_ref, &ref->proc->zombie_refs);
-	binder_queue_for_zombie_cleanup(ref->proc);
-	binder_proc_unlock(ref->proc, __LINE__);
-
-	binder_proc_lock(node_proc, __LINE__);
-	if (ref->node->is_zombie)
-		binder_queue_for_zombie_cleanup(node_proc);
-	hlist_del(&ref->node_entry);
-	binder_proc_unlock(node_proc, __LINE__);
-
-	if (atomic_read(&ref->strong))
-		binder_dec_node(ref->node, 1, 1, line);
-	binder_dec_node(ref->node, 0, 1, line);
-
-	binder_stats_zombie(BINDER_STAT_REF);
+	binder_stats_deleted(BINDER_STAT_REF);
 }
 
+/**
+ * binder_inc_ref() - increment the ref for given handle
+ * @ref:         ref to be incremented
+ * @strong:      if true, strong increment, else weak
+ * @target_list: list to queue node work on
+ *
+ * Increment the ref.
+ *
+ * Return: 0, if successful, else errno
+ */
 static int binder_inc_ref(struct binder_ref *ref, int strong,
 			  struct binder_worklist *target_list, int line)
 {
 	int ret = 0;
 
-	/* atomic_inc_return does not require explicit barrier */
-	if ((strong && atomic_inc_return(&ref->strong) == 1) ||
-	    (!strong && atomic_inc_return(&ref->weak) == 1)) {
-		ret = binder_inc_node(ref->node, strong, 1, target_list, line);
-		if (ret) {
-			atomic_dec(strong ? &ref->strong : &ref->weak);
-			smp_mb__after_atomic();
-		}
-	}
-
-	return ret;
-}
-
-static int binder_dec_ref(struct binder_ref *ref, int strong, int line)
-{
 	if (strong) {
-		/* atomic_dec_if_positive does not require explicit barrier */
-		int newval = atomic_dec_if_positive(&ref->strong);
-
-		if (newval < 0) {
-			binder_user_error("%d invalid dec strong, ref %d desc %d s %d w %d\n",
-					  ref->proc->pid, ref->debug_id,
-					  ref->desc, atomic_read(&ref->strong),
-					  atomic_read(&ref->weak));
-			return -EINVAL;
-		}
-		if (newval == 0) {
-			int ret = binder_dec_node(ref->node, strong, 1, line);
+		if (ref->data.strong == 0) {
+			ret = binder_inc_node(ref->node, 1, 1, target_list);
 			if (ret)
 				return ret;
 		}
+		ref->data.strong++;
 	} else {
-		int newval = atomic_dec_if_positive(&ref->weak);
-
-		if (newval < 0) {
-			binder_user_error("%d invalid dec weak, ref %d desc %d s %d w %d\n",
-					  ref->proc->pid, ref->debug_id,
-					  ref->desc, atomic_read(&ref->strong),
-					  atomic_read(&ref->weak));
-			return -EINVAL;
+		if (ref->data.weak == 0) {
+			ret = binder_inc_node(ref->node, 0, 1, target_list);
+			if (ret)
+				return ret;
 		}
+		ref->data.weak++;
 	}
 
-	if (atomic_read(&ref->strong) == 0 && atomic_read(&ref->weak) == 0)
-		/* it is possible that multiple threads could observe the
-		 * strong/weak references going to 0 at the same time.
-		 * This case is handled when the proc lock is acquired
-		 * in binder_delete_ref()
+/**
+ * binder_dec_ref() - dec the ref for given handle
+ * @ref:	ref to be decremented
+ * @strong:	if true, strong decrement, else weak
+ *
+ * Decrement the ref.
+ *
+ * TODO: kfree is avoided here since an upcoming patch
+ * will put this under a lock.
+ *
+ * Return: true if ref is cleaned up and ready to be freed
+ */
+static bool binder_dec_ref(struct binder_ref *ref, int strong)
+{
+	if (strong) {
+		if (ref->data.strong == 0) {
+			binder_user_error("%d invalid dec strong, ref %d desc %d s %d w %d\n",
+					  ref->proc->pid, ref->data.debug_id,
+					  ref->data.desc, ref->data.strong,
+					  ref->data.weak);
+			return false;
+		}
+		ref->data.strong--;
+		if (ref->data.strong == 0) {
+			int ret;
+
+			ret = binder_dec_node(ref->node, strong, 1);
+			if (ret)
+				return false;
+		}
+	} else {
+		if (ref->data.weak == 0) {
+			binder_user_error("%d invalid dec weak, ref %d desc %d s %d w %d\n",
+					  ref->proc->pid, ref->data.debug_id,
+					  ref->data.desc, ref->data.strong,
+					  ref->data.weak);
+			return false;
+		}
+		ref->data.weak--;
+	}
+	if (ref->data.strong == 0 && ref->data.weak == 0) {
+		binder_cleanup_ref(ref);
+		/*
+		 * TODO: we could kfree(ref) here, but an upcoming
+		 * patch will call this with a lock held, so we
+		 * return an indication that the ref should be
+		 * freed.
 		 */
-		binder_delete_ref(ref, false, line);
-	return 0;
+		return true;
+	}
+	return false;
+}
+
+/**
+ * binder_get_node_from_ref() - get the node from the given proc/desc
+ * @proc:	proc containing the ref
+ * @desc:	the handle associated with the ref
+ * @need_strong_ref: if true, only return node if ref is strong
+ * @rdata:	the id/refcount data for the ref
+ *
+ * Given a proc and ref handle, return the associated binder_node
+ *
+ * Return: a binder_node or NULL if not found or not strong when strong required
+ */
+static struct binder_node *binder_get_node_from_ref(
+		struct binder_proc *proc,
+		u32 desc, bool need_strong_ref,
+		struct binder_ref_data *rdata)
+{
+	struct binder_node *node;
+	struct binder_ref *ref;
+
+	ref = binder_get_ref(proc, desc, need_strong_ref);
+	if (!ref)
+		goto err_no_ref;
+	node = ref->node;
+	if (rdata)
+		*rdata = ref->data;
+
+	return node;
+
+err_no_ref:
+	return NULL;
+}
+
+/**
+ * binder_free_ref() - free the binder_ref
+ * @ref:	ref to free
+ *
+ * Free the binder_ref and the binder_ref_death indicated by ref->death.
+ */
+static void binder_free_ref(struct binder_ref *ref)
+{
+	kfree(ref->death);
+	kfree(ref);
+}
+
+/**
+ * binder_update_ref_for_handle() - inc/dec the ref for given handle
+ * @proc:	proc containing the ref
+ * @desc:	the handle associated with the ref
+ * @increment:	true=inc reference, false=dec reference
+ * @strong:	true=strong reference, false=weak reference
+ * @rdata:	the id/refcount data for the ref
+ *
+ * Given a proc and ref handle, increment or decrement the ref
+ * according to "increment" arg.
+ *
+ * Return: 0 if successful, else errno
+ */
+static int binder_update_ref_for_handle(struct binder_proc *proc,
+		uint32_t desc, bool increment, bool strong,
+		struct binder_ref_data *rdata)
+{
+	int ret = 0;
+	struct binder_ref *ref;
+	bool delete_ref = false;
+
+	ref = binder_get_ref(proc, desc, strong);
+	if (!ref) {
+		ret = -EINVAL;
+		goto err_no_ref;
+	}
+	if (increment)
+		ret = binder_inc_ref(ref, strong, NULL);
+	else
+		delete_ref = binder_dec_ref(ref, strong);
+
+	if (rdata)
+		*rdata = ref->data;
+
+	if (delete_ref)
+		binder_free_ref(ref);
+	return ret;
+
+err_no_ref:
+	return ret;
+}
+
+/**
+ * binder_dec_ref_for_handle() - dec the ref for given handle
+ * @proc:	proc containing the ref
+ * @desc:	the handle associated with the ref
+ * @strong:	true=strong reference, false=weak reference
+ * @rdata:	the id/refcount data for the ref
+ *
+ * Just calls binder_update_ref_for_handle() to decrement the ref.
+ *
+ * Return: 0 if successful, else errno
+ */
+static int binder_dec_ref_for_handle(struct binder_proc *proc,
+		uint32_t desc, bool strong, struct binder_ref_data *rdata)
+{
+	return binder_update_ref_for_handle(proc, desc, false, strong, rdata);
+}
+
+
+/**
+ * binder_inc_ref_for_node() - increment the ref for given proc/node
+ * @proc:	 proc containing the ref
+ * @node:	 target node
+ * @strong:	 true=strong reference, false=weak reference
+ * @target_list: worklist to use if node is incremented
+ * @rdata:	 the id/refcount data for the ref
+ *
+ * Given a proc and node, increment the ref. Create the ref if it
+ * doesn't already exist
+ *
+ * Return: 0 if successful, else errno
+ */
+static int binder_inc_ref_for_node(struct binder_proc *proc,
+			struct binder_node *node,
+			bool strong,
+			struct list_head *target_list,
+			struct binder_ref_data *rdata)
+{
+	struct binder_ref *ref;
+	struct binder_ref *new_ref = NULL;
+	int ret = 0;
+
+	ref = binder_get_ref_for_node(proc, node, NULL);
+	if (!ref) {
+		new_ref = kzalloc(sizeof(*ref), GFP_KERNEL);
+		if (!new_ref)
+			return -ENOMEM;
+		ref = binder_get_ref_for_node(proc, node, new_ref);
+	}
+	ret = binder_inc_ref(ref, strong, target_list);
+	*rdata = ref->data;
+	if (new_ref && ref != new_ref)
+		/*
+		 * Another thread created the ref first so
+		 * free the one we allocated
+		 */
+		kfree(new_ref);
+	return ret;
 }
 
 static inline void binder_put_ref(struct binder_ref *ref)
@@ -1384,22 +1592,21 @@ static void binder_transaction_buffer_release(struct binder_proc *proc,
 		case BINDER_TYPE_HANDLE:
 		case BINDER_TYPE_WEAK_HANDLE: {
 			struct flat_binder_object *fp;
-			struct binder_ref *ref;
+			struct binder_ref_data rdata;
+			int ret;
 
 			fp = to_flat_binder_object(hdr);
-			ref = binder_get_ref(proc, fp->handle,
-					     hdr->type == BINDER_TYPE_HANDLE);
-			if (ref == NULL) {
-				pr_err("transaction release %d bad handle %d, target died\n",
-				 debug_id, fp->handle);
+			ret = binder_dec_ref_for_handle(proc, fp->handle,
+				hdr->type == BINDER_TYPE_HANDLE, &rdata);
+
+			if (ret) {
+				pr_err("transaction release %d bad handle %d, ret = %d\n",
+				 debug_id, fp->handle, ret);
 				break;
 			}
 			binder_debug(BINDER_DEBUG_TRANSACTION,
-				     "        ref %d desc %d (node %d)\n",
-				     ref->debug_id, ref->desc, ref->node->debug_id);
-			binder_dec_ref(ref, hdr->type == BINDER_TYPE_HANDLE,
-				       __LINE__);
-			binder_put_ref(ref);
+				     "        ref %d desc %d\n",
+				     rdata.debug_id, rdata.desc);
 		} break;
 
 		case BINDER_TYPE_FD: {
@@ -1471,9 +1678,10 @@ static int binder_translate_binder(struct flat_binder_object *fp,
 				   struct binder_thread *thread)
 {
 	struct binder_node *node;
-	struct binder_ref *ref;
 	struct binder_proc *proc = thread->proc;
 	struct binder_proc *target_proc = t->to_proc;
+	struct binder_ref_data rdata;
+	int ret;
 
 	node = binder_get_node(proc, fp->binder);
 	if (!node) {
@@ -1499,27 +1707,25 @@ static int binder_translate_binder(struct flat_binder_object *fp,
 		return -EPERM;
 	}
 
-	ref = binder_get_ref_for_node(target_proc, node);
-	if (!ref)
-		return -ENOMEM;
+	ret = binder_inc_ref_for_node(target_proc, node,
+			fp->hdr.type == BINDER_TYPE_BINDER,
+			&thread->todo, &rdata);
+	if (ret)
+		return ret;
 
 	if (fp->hdr.type == BINDER_TYPE_BINDER)
 		fp->hdr.type = BINDER_TYPE_HANDLE;
 	else
 		fp->hdr.type = BINDER_TYPE_WEAK_HANDLE;
 	fp->binder = 0;
-	fp->handle = ref->desc;
+	fp->handle = rdata.desc;
 	fp->cookie = 0;
-	binder_inc_ref(ref, fp->hdr.type == BINDER_TYPE_HANDLE, &thread->todo,
-		       __LINE__);
 
-	trace_binder_transaction_node_to_ref(t, node, ref);
+	trace_binder_transaction_node_to_ref(t, node, &rdata);
 	binder_debug(BINDER_DEBUG_TRANSACTION,
 		     "        node %d u%016llx -> ref %d desc %d\n",
 		     node->debug_id, (u64)node->ptr,
-		     ref->debug_id, ref->desc);
-	binder_put_ref(ref);
-	binder_put_node(node);
+		     rdata.debug_id, rdata.desc);
 	return 0;
 }
 
@@ -1527,13 +1733,14 @@ static int binder_translate_handle(struct flat_binder_object *fp,
 				   struct binder_transaction *t,
 				   struct binder_thread *thread)
 {
-	struct binder_ref *ref;
 	struct binder_proc *proc = thread->proc;
 	struct binder_proc *target_proc = t->to_proc;
+	struct binder_node *node;
+	struct binder_ref_data src_rdata;
 
-	ref = binder_get_ref(proc, fp->handle,
-			     fp->hdr.type == BINDER_TYPE_HANDLE);
-	if (!ref) {
+	node = binder_get_node_from_ref(proc, fp->handle,
+			fp->hdr.type == BINDER_TYPE_HANDLE, &src_rdata);
+	if (!node) {
 		binder_user_error("%d:%d got transaction with invalid handle, %d\n",
 				  proc->pid, thread->pid, fp->handle);
 		return -EINVAL;
@@ -1543,38 +1750,41 @@ static int binder_translate_handle(struct flat_binder_object *fp,
 		return -EPERM;
 	}
 
-	if (ref->node->proc == target_proc) {
+	if (node->proc == target_proc) {
 		if (fp->hdr.type == BINDER_TYPE_HANDLE)
 			fp->hdr.type = BINDER_TYPE_BINDER;
 		else
 			fp->hdr.type = BINDER_TYPE_WEAK_BINDER;
-		fp->binder = ref->node->ptr;
-		fp->cookie = ref->node->cookie;
-		binder_inc_node(ref->node, fp->hdr.type == BINDER_TYPE_BINDER,
-				0, NULL, __LINE__);
-		trace_binder_transaction_ref_to_node(t, ref);
+		fp->binder = node->ptr;
+		fp->cookie = node->cookie;
+		binder_inc_node(node,
+				fp->hdr.type == BINDER_TYPE_BINDER,
+				0, NULL);
+		trace_binder_transaction_ref_to_node(t, node, &src_rdata);
 		binder_debug(BINDER_DEBUG_TRANSACTION,
 			     "        ref %d desc %d -> node %d u%016llx\n",
-			     ref->debug_id, ref->desc, ref->node->debug_id,
-			     (u64)ref->node->ptr);
+			     src_rdata.debug_id, src_rdata.desc, node->debug_id,
+			     (u64)node->ptr);
 	} else {
-		struct binder_ref *new_ref;
+		int ret;
+		struct binder_ref_data dest_rdata;
 
-		new_ref = binder_get_ref_for_node(target_proc, ref->node);
-		if (!new_ref)
-			return -ENOMEM;
+		ret = binder_inc_ref_for_node(target_proc, node,
+				fp->hdr.type == BINDER_TYPE_HANDLE,
+				NULL, &dest_rdata);
+		if (ret)
+			return ret;
 
 		fp->binder = 0;
-		fp->handle = new_ref->desc;
+		fp->handle = dest_rdata.desc;
 		fp->cookie = 0;
-		binder_inc_ref(new_ref, fp->hdr.type == BINDER_TYPE_HANDLE,
-			       NULL, __LINE__);
-		trace_binder_transaction_ref_to_ref(t, ref, new_ref);
+		trace_binder_transaction_ref_to_ref(t, node, &src_rdata,
+						    &dest_rdata);
 		binder_debug(BINDER_DEBUG_TRANSACTION,
 			     "        ref %d desc %d -> ref %d desc %d (node %d)\n",
-			     ref->debug_id, ref->desc, new_ref->debug_id,
-			     new_ref->desc, ref->node->debug_id);
-		binder_put_ref(new_ref);
+			     src_rdata.debug_id, src_rdata.desc,
+			     dest_rdata.debug_id, dest_rdata.desc,
+			     node->debug_id);
 	}
 	binder_put_ref(ref);
 	return 0;
@@ -2328,6 +2538,8 @@ static int binder_thread_write(struct binder_proc *proc,
 	void __user *end = buffer + size;
 
 	while (ptr < end && thread->return_error.cmd == BR_OK) {
+		int ret;
+
 		if (get_user(cmd, (uint32_t __user *)ptr))
 			return -EFAULT;
 		ptr += sizeof(uint32_t);
@@ -2343,68 +2555,61 @@ static int binder_thread_write(struct binder_proc *proc,
 		case BC_RELEASE:
 		case BC_DECREFS: {
 			uint32_t target;
-			struct binder_ref *ref = NULL;
 			const char *debug_string;
-			struct binder_node *ctx_mgr_node =
-				context->binder_context_mgr_node;
+			bool strong = cmd == BC_ACQUIRE || cmd == BC_RELEASE;
+			bool increment = cmd == BC_INCREFS || cmd == BC_ACQUIRE;
+			struct binder_ref_data rdata;
 
 			if (get_user(target, (uint32_t __user *)ptr))
 				return -EFAULT;
 
 			ptr += sizeof(uint32_t);
-			if (target == 0 &&
-			    (cmd == BC_INCREFS || cmd == BC_ACQUIRE)) {
+			ret = -1;
+			if (increment && !target) {
 				struct binder_node *ctx_mgr_node;
-
 				mutex_lock(&context->context_mgr_node_lock);
 				ctx_mgr_node = context->binder_context_mgr_node;
-				if (ctx_mgr_node) {
-					ref = binder_get_ref_for_node(proc,
-							ctx_mgr_node);
-					if (ref && ref->desc != target) {
-						binder_user_error("%d:%d tried to acquire reference to desc 0, got %d instead\n",
-							proc->pid, thread->pid,
-							ref->desc);
-					}
-				}
+				if (ctx_mgr_node)
+					ret = binder_inc_ref_for_node(
+							proc, ctx_mgr_node,
+							strong, NULL, &rdata);
 				mutex_unlock(&context->context_mgr_node_lock);
 			}
-			if (ref == NULL)
-				ref = binder_get_ref(proc, target,
-						     cmd == BC_ACQUIRE ||
-						     cmd == BC_RELEASE);
-			if (ref == NULL) {
-				binder_user_error("%d:%d refcount change on invalid ref %d\n",
-					proc->pid, thread->pid, target);
-				break;
+			if (ret)
+				ret = binder_update_ref_for_handle(
+						proc, target, increment, strong,
+						&rdata);
+			if (!ret && rdata.desc != target) {
+				binder_user_error("%d:%d tried to acquire reference to desc %d, got %d instead\n",
+					proc->pid, thread->pid,
+					target, rdata.desc);
 			}
 			switch (cmd) {
 			case BC_INCREFS:
 				debug_string = "IncRefs";
-				binder_inc_ref(ref, 0, NULL, __LINE__);
 				break;
 			case BC_ACQUIRE:
 				debug_string = "Acquire";
-				binder_inc_ref(ref, 1, NULL, __LINE__);
 				break;
 			case BC_RELEASE:
 				debug_string = "Release";
-				binder_dec_ref(ref, 1, __LINE__);
 				break;
 			case BC_DECREFS:
 			default:
 				debug_string = "DecRefs";
-				binder_dec_ref(ref, 0, __LINE__);
+				break;
+			}
+			if (ret) {
+				binder_user_error("%d:%d %s %d refcount change on invalid ref %d ret %d\n",
+					proc->pid, thread->pid, debug_string,
+					strong, target, ret);
 				break;
 			}
 			binder_debug(BINDER_DEBUG_USER_REFS,
-				     "%d:%d %s ref %d desc %d s %d w %d for node %d\n",
+				     "%d:%d %s ref %d desc %d s %d w %d\n",
 				     proc->pid, thread->pid, debug_string,
-				     ref->debug_id, ref->desc,
-				     atomic_read(&ref->strong),
-				     atomic_read(&ref->weak),
-				     ref->node->debug_id);
-			binder_put_ref(ref);
+				     rdata.debug_id, rdata.desc, rdata.strong,
+				     rdata.weak);
 			break;
 		}
 		case BC_INCREFS_DONE:
@@ -2628,10 +2833,9 @@ static int binder_thread_write(struct binder_proc *proc,
 				     cmd == BC_REQUEST_DEATH_NOTIFICATION ?
 				     "BC_REQUEST_DEATH_NOTIFICATION" :
 				     "BC_CLEAR_DEATH_NOTIFICATION",
-				     (u64)cookie, ref->debug_id, ref->desc,
-				     atomic_read(&ref->strong),
-				     atomic_read(&ref->weak),
-				     ref->node->debug_id);
+				     (u64)cookie, ref->data.debug_id,
+				     ref->data.desc, ref->data.strong,
+				     ref->data.weak, ref->node->debug_id);
 
 			if (cmd == BC_REQUEST_DEATH_NOTIFICATION) {
 				if (ref->death) {
@@ -4109,9 +4313,8 @@ static void binder_deferred_release(struct binder_proc *proc)
 
 		ref = rb_entry(n, struct binder_ref, rb_node_desc);
 		outgoing_refs++;
-		binder_proc_unlock(proc, __LINE__);
-		binder_delete_ref(ref, true, __LINE__);
-		binder_proc_lock(proc, __LINE__);
+		binder_cleanup_ref(ref);
+		binder_free_ref(ref);
 	}
 	binder_proc_unlock(proc, __LINE__);
 
@@ -4333,10 +4536,11 @@ static void _print_binder_node(struct seq_file *m,
 static void _print_binder_ref(struct seq_file *m,
 			      struct binder_ref *ref)
 {
-	seq_printf(m, "  ref %d: desc %d %snode %d s %d w %d d %p\n",
-		   ref->debug_id, ref->desc, ref->node->proc ? "" : "dead ",
-		   ref->node->debug_id, atomic_read(&ref->strong),
-		   atomic_read(&ref->weak), ref->death);
+	seq_printf(m, "  ref %d: desc %d %snode %d s %d w %d d %pK\n",
+		   ref->data.debug_id, ref->data.desc,
+		   ref->node->proc ? "" : "dead ",
+		   ref->node->debug_id, ref->data.strong,
+		   ref->data.weak, ref->death);
 }
 
 static void print_binder_proc(struct seq_file *m,
@@ -4538,8 +4742,8 @@ static void print_binder_proc_stats(struct seq_file *m,
 		struct binder_ref *ref = rb_entry(n, struct binder_ref,
 						  rb_node_desc);
 		count++;
-		strong += atomic_read(&ref->strong);
-		weak += atomic_read(&ref->weak);
+		strong += ref->data.strong;
+		weak += ref->data.weak;
 	}
 	binder_proc_unlock(proc, __LINE__);
 	seq_printf(m, "  refs: %d s %d w %d\n", count, strong, weak);
