@@ -2840,6 +2840,37 @@ static int binder_wait_for_work(struct binder_thread *thread,
 	return ret;
 }
 
+static int binder_put_node_cmd(struct binder_proc *proc,
+			       struct binder_thread *thread,
+			       void __user **ptrp,
+			       binder_uintptr_t node_ptr,
+			       binder_uintptr_t node_cookie,
+			       int node_debug_id,
+			       uint32_t cmd, const char *cmd_name)
+{
+	void __user *ptr = *ptrp;
+
+	if (put_user(cmd, (uint32_t __user *)ptr))
+		return -EFAULT;
+	ptr += sizeof(uint32_t);
+
+	if (put_user(node_ptr, (binder_uintptr_t __user *)ptr))
+		return -EFAULT;
+	ptr += sizeof(binder_uintptr_t);
+
+	if (put_user(node_cookie, (binder_uintptr_t __user *)ptr))
+		return -EFAULT;
+	ptr += sizeof(binder_uintptr_t);
+
+	binder_stat_br(proc, thread, cmd);
+	binder_debug(BINDER_DEBUG_USER_REFS, "%d:%d %s %d u%016llx c%016llx\n",
+		     proc->pid, thread->pid, cmd_name, node_debug_id,
+		     (u64)node_ptr, (u64)node_cookie);
+
+	*ptrp = ptr;
+	return 0;
+}
+
 static int binder_thread_read(struct binder_proc *proc,
 			      struct binder_thread **threadp,
 			      binder_uintptr_t binder_buffer, size_t size,
@@ -2981,63 +3012,78 @@ retry:
 		} break;
 		case BINDER_WORK_NODE: {
 			struct binder_node *node = container_of(w, struct binder_node, work);
-			uint32_t cmd[2];
-			const char *cmd_name[2];
-			int cmd_count = 0;
 			int strong, weak;
-			struct binder_proc *proc = node->proc;
-			int i;
+			binder_uintptr_t node_ptr = node->ptr;
+			binder_uintptr_t node_cookie = node->cookie;
+			int node_debug_id = node->debug_id;
+			int has_weak_ref;
+			int has_strong_ref;
+			void __user *orig_ptr = ptr;
 
-			binder_proc_lock(proc, __LINE__);
+			BUG_ON(proc != node->proc);
 			strong = node->internal_strong_refs ||
 					node->local_strong_refs;
 			weak = !hlist_empty(&node->refs) ||
 					node->local_weak_refs || strong;
+			has_strong_ref = node->has_strong_ref;
+			has_weak_ref = node->has_weak_ref;
 
-			if (weak && !node->has_weak_ref) {
-				cmd[cmd_count] = BR_INCREFS;
-				cmd_name[cmd_count++] = "BR_INCREFS";
+			if (weak && !has_weak_ref) {
 				node->has_weak_ref = 1;
 				node->pending_weak_ref = 1;
 				node->local_weak_refs++;
 			}
-			if (strong && !node->has_strong_ref) {
-				cmd[cmd_count] = BR_ACQUIRE;
-				cmd_name[cmd_count++] = "BR_ACQUIRE";
+			if (strong && !has_strong_ref) {
 				node->has_strong_ref = 1;
 				node->pending_strong_ref = 1;
 				node->local_strong_refs++;
 			}
-			if (!strong && node->has_strong_ref) {
-				cmd[cmd_count] = BR_RELEASE;
-				cmd_name[cmd_count++] = "BR_RELEASE";
+			if (!strong && has_strong_ref)
 				node->has_strong_ref = 0;
-			}
-			if (!weak && node->has_weak_ref) {
-				cmd[cmd_count] = BR_DECREFS;
-				cmd_name[cmd_count++] = "BR_DECREFS";
+			if (!weak && has_weak_ref)
 				node->has_weak_ref = 0;
-			}
-			if (cmd != BR_NOOP) {
-				if (put_user(cmd, (uint32_t __user *)ptr))
-					return -EFAULT;
-				ptr += sizeof(uint32_t);
-				if (put_user(node->ptr,
-					     (binder_uintptr_t __user *)ptr))
-					return -EFAULT;
-				ptr += sizeof(binder_uintptr_t);
-				if (put_user(node->cookie,
-					     (binder_uintptr_t __user *)ptr))
-					return -EFAULT;
-				ptr += sizeof(binder_uintptr_t);
+			list_del(&w->entry);
 
-				binder_stat_br(proc, thread, cmd[i]);
-				binder_debug(BINDER_DEBUG_USER_REFS,
-					     "%d:%d %s %d u%016llx c%016llx\n",
+			if (!weak && !strong) {
+				binder_debug(BINDER_DEBUG_INTERNAL_REFS,
+					     "%d:%d node %d u%016llx c%016llx deleted\n",
 					     proc->pid, thread->pid,
-					     cmd_name[i], node->debug_id,
-					     (u64)node->ptr, (u64)node->cookie);
+					     node_debug_id,
+					     (u64)node_ptr,
+					     (u64)node_cookie);
+				rb_erase(&node->rb_node, &proc->nodes);
+				kfree(node);
+				binder_stats_deleted(BINDER_STAT_NODE);
 			}
+			if (weak && !has_weak_ref)
+				ret = binder_put_node_cmd(
+						proc, thread, &ptr, node_ptr,
+						node_cookie, node_debug_id,
+						BR_INCREFS, "BR_INCREFS");
+			if (!ret && strong && !has_strong_ref)
+				ret = binder_put_node_cmd(
+						proc, thread, &ptr, node_ptr,
+						node_cookie, node_debug_id,
+						BR_ACQUIRE, "BR_ACQUIRE");
+			if (!ret && !strong && has_strong_ref)
+				ret = binder_put_node_cmd(
+						proc, thread, &ptr, node_ptr,
+						node_cookie, node_debug_id,
+						BR_RELEASE, "BR_RELEASE");
+			if (!ret && !weak && has_weak_ref)
+				ret = binder_put_node_cmd(
+						proc, thread, &ptr, node_ptr,
+						node_cookie, node_debug_id,
+						BR_DECREFS, "BR_DECREFS");
+			if (orig_ptr == ptr)
+				binder_debug(BINDER_DEBUG_INTERNAL_REFS,
+					     "%d:%d node %d u%016llx c%016llx state unchanged\n",
+					     proc->pid, thread->pid,
+					     node_debug_id,
+					     (u64)node_ptr,
+					     (u64)node_cookie);
+			if (ret)
+				return ret;
 		} break;
 		case BINDER_WORK_DEAD_BINDER:
 		case BINDER_WORK_DEAD_BINDER_AND_CLEAR:
