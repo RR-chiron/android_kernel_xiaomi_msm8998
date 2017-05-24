@@ -4563,21 +4563,24 @@ static void print_binder_proc_stats(struct seq_file *m,
 static int binder_state_show(struct seq_file *m, void *unused)
 {
 	struct binder_proc *proc;
+	struct binder_node *node;
+
+	binder_lock(__func__);
 
 	seq_puts(m, "binder state:\n");
 
 	mutex_lock(&binder_procs_lock);
 	hlist_for_each_entry(proc, &binder_procs, proc_node)
 		print_binder_proc(m, proc, 1);
-	mutex_unlock(&binder_procs_lock);
+	binder_unlock(__func__);
 	return 0;
 }
 
 static int binder_stats_show(struct seq_file *m, void *unused)
 {
 	struct binder_proc *proc;
-	int proc_count = 0;
-	int i, sum = 0, maxactive = 0;
+
+	binder_lock(__func__);
 
 	seq_puts(m, "binder stats:\n");
 
@@ -4587,23 +4590,7 @@ static int binder_stats_show(struct seq_file *m, void *unused)
 	hlist_for_each_entry(proc, &binder_procs, proc_node) {
 		proc_count++;
 		print_binder_proc_stats(m, proc);
-	}
-	mutex_unlock(&binder_procs_lock);
-
-	for (i = 0; i < SEQ_BUCKETS; i++) {
-		sum += binder_active_threads[i].active_count;
-		maxactive = max(maxactive,
-				binder_active_threads[i].max_active_count);
-		seq_printf(m, "  activeThread[%d]: %d/%d\n", i,
-			binder_active_threads[i].active_count,
-			binder_active_threads[i].max_active_count);
-	}
-
-	seq_printf(m, "procs=%d active_threads=%d/%d zombie_procs=%d/%d\n",
-			proc_count,
-			sum, maxactive,
-			zombie_procs.active_count,
-			zombie_procs.max_active_count);
+	binder_unlock(__func__);
 	return 0;
 }
 
@@ -4611,11 +4598,13 @@ static int binder_transactions_show(struct seq_file *m, void *unused)
 {
 	struct binder_proc *proc;
 
+	binder_lock(__func__);
+
 	seq_puts(m, "binder transactions:\n");
 	mutex_lock(&binder_procs_lock);
 	hlist_for_each_entry(proc, &binder_procs, proc_node)
 		print_binder_proc(m, proc, 0);
-	mutex_unlock(&binder_procs_lock);
+	binder_unlock(__func__);
 	return 0;
 }
 
@@ -4624,6 +4613,8 @@ static int binder_proc_show(struct seq_file *m, void *unused)
 	struct binder_proc *itr;
 	int pid = (unsigned long)m->private;
 
+	binder_lock(__func__);
+
 	mutex_lock(&binder_procs_lock);
 	hlist_for_each_entry(itr, &binder_procs, proc_node) {
 		if (itr->pid == pid) {
@@ -4631,8 +4622,7 @@ static int binder_proc_show(struct seq_file *m, void *unused)
 			print_binder_proc(m, itr, 1);
 		}
 	}
-	mutex_unlock(&binder_procs_lock);
-
+	binder_unlock(__func__);
 	return 0;
 }
 
