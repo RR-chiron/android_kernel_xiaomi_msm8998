@@ -31,7 +31,8 @@
  * 3) proc->inner_lock : protects the thread and node lists
  *    (proc->threads, proc->nodes) and all todo lists associated
  *    with the binder_proc (proc->todo, thread->todo,
- *    proc->delivered_death and node->async_todo).
+ *    proc->delivered_death and node->async_todo), as well as
+ *    thread->transaction_stack
  *    binder_inner_proc_lock() and binder_inner_proc_unlock()
  *    are used to acq/rel
  *
@@ -601,11 +602,13 @@ enum {
  * @looper_needs_return:  looping thread needs to exit driver
  *                        (no lock needed)
  * @transaction_stack:    stack of in-progress transactions for this thread
+ *                        (protected by @proc->inner_lock)
  * @todo:                 list of work to do for this thread
  *                        (protected by @proc->inner_lock)
  * @return_error:         transaction errors reported by this thread
  *                        (only accessed by this thread)
  * @reply_error:          transaction errors reported by target thread
+ *                        (protected by @proc->inner_lock)
  * @wait:                 wait queue for thread work
  * @stats:                per-thread statistics
  *                        (atomics, no lock needed)
@@ -1801,15 +1804,11 @@ static int binder_inc_ref_for_node(struct binder_proc *proc,
 	return ret;
 }
 
-static inline void binder_put_ref(struct binder_ref *ref)
-{
-	binder_dec_ref(ref, 0, __LINE__);
-}
-
-static void binder_pop_transaction(struct binder_thread *target_thread,
-				   struct binder_transaction *t)
+static void binder_pop_transaction_ilocked(struct binder_thread *target_thread,
+					   struct binder_transaction *t)
 {
 	BUG_ON(!target_thread);
+	BUG_ON(!spin_is_locked(&target_thread->proc->inner_lock));
 	BUG_ON(target_thread->transaction_stack != t);
 	BUG_ON(target_thread->transaction_stack->from != target_thread);
 	target_thread->transaction_stack =
@@ -1893,6 +1892,35 @@ static struct binder_thread *binder_get_txn_from(
 	return from;
 }
 
+/**
+ * binder_get_txn_from_and_acq_inner() - get t->from and acquire inner lock
+ * @t:	binder transaction for t->from
+ *
+ * Same as binder_get_txn_from() except it also acquires the proc->inner_lock
+ * to guarantee that the thread cannot be released while operating on it.
+ * The caller must call binder_inner_proc_unlock() to release the inner lock
+ * as well as call binder_dec_thread_txn() to release the reference.
+ *
+ * Return: the value of t->from
+ */
+static struct binder_thread *binder_get_txn_from_and_acq_inner(
+		struct binder_transaction *t)
+{
+	struct binder_thread *from;
+
+	from = binder_get_txn_from(t);
+	if (!from)
+		return NULL;
+	binder_inner_proc_lock(from->proc);
+	if (t->from) {
+		BUG_ON(from != t->from);
+		return from;
+	}
+	binder_inner_proc_unlock(from->proc);
+	binder_thread_dec_tmpref(from);
+	return NULL;
+}
+
 static void binder_free_transaction(struct binder_transaction *t)
 {
 	if (t->buffer)
@@ -1909,7 +1937,7 @@ static void binder_send_failed_reply(struct binder_transaction *t,
 
 	BUG_ON(t->flags & TF_ONE_WAY);
 	while (1) {
-		target_thread = binder_get_txn_from(t);
+		target_thread = binder_get_txn_from_and_acq_inner(t);
 		if (target_thread) {
 			binder_debug(BINDER_DEBUG_FAILED_TRANSACTION,
 				     "send failed reply for transaction %d to %d:%d\n",
@@ -1917,11 +1945,10 @@ static void binder_send_failed_reply(struct binder_transaction *t,
 				      target_thread->proc->pid,
 				      target_thread->pid);
 
-			binder_pop_transaction(target_thread, t);
+			binder_pop_transaction_ilocked(target_thread, t);
 			if (target_thread->reply_error.cmd == BR_OK) {
 				target_thread->reply_error.cmd = error_code;
-				binder_enqueue_work(
-					target_thread->proc,
+				binder_enqueue_work_ilocked(
 					&target_thread->reply_error.work,
 					&target_thread->todo);
 				wake_up_interruptible(&target_thread->wait);
@@ -1929,6 +1956,7 @@ static void binder_send_failed_reply(struct binder_transaction *t,
 				WARN(1, "Unexpected reply error: %u\n",
 						target_thread->reply_error.cmd);
 			}
+			binder_inner_proc_unlock(target_thread->proc);
 			binder_thread_dec_tmpref(target_thread);
 			binder_free_transaction(t);
 			return;
@@ -2559,10 +2587,10 @@ static void binder_transaction(struct binder_proc *proc,
 	e->context_name = proc->context->name;
 
 	if (reply) {
-		binder_proc_lock(thread->proc, __LINE__);
+		binder_inner_proc_lock(proc);
 		in_reply_to = thread->transaction_stack;
 		if (in_reply_to == NULL) {
-			binder_proc_unlock(thread->proc, __LINE__);
+			binder_inner_proc_unlock(proc);
 			binder_user_error("%d:%d got reply transaction with no transaction stack\n",
 					  proc->pid, thread->pid);
 			return_error = BR_FAILED_REPLY;
@@ -2579,6 +2607,7 @@ static void binder_transaction(struct binder_proc *proc,
 				in_reply_to->to_thread ?
 				in_reply_to->to_thread->pid : 0);
 			spin_unlock(&in_reply_to->lock);
+			binder_inner_proc_unlock(proc);
 			return_error = BR_FAILED_REPLY;
 			return_error_param = -EPROTO;
 			return_error_line = __LINE__;
@@ -2586,7 +2615,9 @@ static void binder_transaction(struct binder_proc *proc,
 			goto err_bad_call_stack;
 		}
 		thread->transaction_stack = in_reply_to->to_parent;
-		target_thread = binder_get_txn_from(in_reply_to);
+		binder_inner_proc_unlock(proc);
+		binder_set_nice(in_reply_to->saved_priority);
+		target_thread = binder_get_txn_from_and_acq_inner(in_reply_to);
 		if (target_thread == NULL) {
 			return_error = BR_DEAD_REPLY;
 			return_error_line = __LINE__;
@@ -2599,7 +2630,7 @@ static void binder_transaction(struct binder_proc *proc,
 				target_thread->transaction_stack ?
 				target_thread->transaction_stack->debug_id : 0,
 				in_reply_to->debug_id);
-			binder_proc_unlock(target_thread->proc, __LINE__);
+			binder_inner_proc_unlock(target_thread->proc);
 			return_error = BR_FAILED_REPLY;
 			return_error_param = -EPROTO;
 			return_error_line = __LINE__;
@@ -2610,6 +2641,7 @@ static void binder_transaction(struct binder_proc *proc,
 		binder_proc_unlock(target_thread->proc, __LINE__);
 		target_proc = target_thread->proc;
 		target_proc->tmp_ref++;
+		binder_inner_proc_unlock(target_thread->proc);
 	} else {
 		if (tr->target.handle) {
 			struct binder_ref *ref;
@@ -2666,7 +2698,7 @@ static void binder_transaction(struct binder_proc *proc,
 			return_error_line = __LINE__;
 			goto err_invalid_target_handle;
 		}
-		binder_proc_lock(thread->proc, __LINE__);
+		binder_inner_proc_lock(proc);
 		if (!(tr->flags & TF_ONE_WAY) && thread->transaction_stack) {
 			struct binder_transaction *tmp;
 
@@ -2679,6 +2711,7 @@ static void binder_transaction(struct binder_proc *proc,
 					tmp->to_thread ?
 					tmp->to_thread->pid : 0);
 				spin_unlock(&tmp->lock);
+				binder_inner_proc_unlock(proc);
 				return_error = BR_FAILED_REPLY;
 				return_error_param = -EPROTO;
 				return_error_line = __LINE__;
@@ -2699,7 +2732,7 @@ static void binder_transaction(struct binder_proc *proc,
 				tmp = tmp->from_parent;
 			}
 		}
-		binder_proc_unlock(thread->proc, __LINE__);
+		binder_inner_proc_unlock(proc);
 	}
 	if (target_thread) {
 		e->to_thread = target_thread->pid;
@@ -2982,25 +3015,34 @@ static void binder_transaction(struct binder_proc *proc,
 	t->work.type = BINDER_WORK_TRANSACTION;
 
 	if (reply) {
-		if (target_thread->is_dead)
+		binder_inner_proc_lock(target_proc);
+		if (target_thread->is_dead) {
+			binder_inner_proc_unlock(target_proc);
 			goto err_dead_proc_or_thread;
+		}
 		BUG_ON(t->buffer->async_transaction != 0);
-		binder_proc_lock(target_thread->proc, __LINE__);
-		binder_pop_transaction(target_thread, in_reply_to);
+		binder_pop_transaction_ilocked(target_thread, in_reply_to);
+		binder_enqueue_work_ilocked(&t->work, target_list);
+		binder_inner_proc_unlock(target_proc);
 		binder_free_transaction(in_reply_to);
-		binder_enqueue_work(target_proc, &t->work, target_list);
 	} else if (!(t->flags & TF_ONE_WAY)) {
 		BUG_ON(t->buffer->async_transaction != 0);
-		binder_proc_lock(thread->proc, __LINE__);
+		binder_inner_proc_lock(proc);
 		t->need_reply = 1;
 		t->from_parent = thread->transaction_stack;
 		thread->transaction_stack = t;
+		binder_inner_proc_unlock(proc);
+		binder_inner_proc_lock(target_proc);
 		if (target_proc->is_dead ||
 				(target_thread && target_thread->is_dead)) {
-			binder_pop_transaction(thread, t);
+			binder_inner_proc_unlock(target_proc);
+			binder_inner_proc_lock(proc);
+			binder_pop_transaction_ilocked(thread, t);
+			binder_inner_proc_unlock(proc);
 			goto err_dead_proc_or_thread;
 		}
-		binder_enqueue_work(target_proc, &t->work, target_list);
+		binder_enqueue_work_ilocked(&t->work, target_list);
+		binder_inner_proc_unlock(target_proc);
 	} else {
 		BUG_ON(target_node == NULL);
 		BUG_ON(t->buffer->async_transaction != 1);
@@ -3014,12 +3056,15 @@ static void binder_transaction(struct binder_proc *proc,
 		 * must be atomic with enqueue on
 		 * async_todo
 		 */
+		binder_inner_proc_lock(target_proc);
 		if (target_proc->is_dead ||
 				(target_thread && target_thread->is_dead)) {
+			binder_inner_proc_unlock(target_proc);
 			binder_node_unlock(target_node);
 			goto err_dead_proc_or_thread;
 		}
-		binder_enqueue_work(target_proc, &t->work, target_list);
+		binder_enqueue_work_ilocked(&t->work, target_list);
+		binder_inner_proc_unlock(target_proc);
 		binder_node_unlock(target_node);
 	}
 	if (target_wait) {
@@ -3648,8 +3693,10 @@ static int binder_thread_read(struct binder_proc *proc,
 	}
 
 retry:
+	binder_inner_proc_lock(proc);
 	wait_for_proc_work = thread->transaction_stack == NULL &&
-		binder_worklist_empty(proc, &thread->todo);
+		binder_worklist_empty_ilocked(&thread->todo);
+	binder_inner_proc_unlock(proc);
 
 	thread->looper |= BINDER_LOOPER_STATE_WAITING;
 	if (wait_for_proc_work)
@@ -3957,11 +4004,11 @@ retry:
 			binder_thread_dec_tmpref(t_from);
 		t->buffer->allow_user_free = 1;
 		if (cmd == BR_TRANSACTION && !(t->flags & TF_ONE_WAY)) {
-			binder_proc_lock(thread->proc, __LINE__);
+			binder_inner_proc_lock(thread->proc);
 			t->to_parent = thread->transaction_stack;
 			t->to_thread = thread;
 			thread->transaction_stack = t;
-			binder_proc_unlock(thread->proc, __LINE__);
+			binder_inner_proc_unlock(thread->proc);
 		} else {
 			binder_free_transaction(t);
 		}
@@ -4285,8 +4332,10 @@ static unsigned int binder_poll(struct file *filp,
 
 	thread = binder_get_thread(proc);
 
+	binder_inner_proc_lock(thread->proc);
 	wait_for_proc_work = thread->transaction_stack == NULL &&
-		binder_worklist_empty(proc, &thread->todo);
+		binder_worklist_empty_ilocked(&thread->todo);
+	binder_inner_proc_unlock(thread->proc);
 
 	binder_unlock(__func__);
 
