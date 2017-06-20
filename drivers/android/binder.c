@@ -4826,26 +4826,28 @@ out:
 	return ret;
 }
 
-static inline u64 binder_get_thread_seq(void)
-{
-	u64 thread_seq = ~0ULL;
-	int i;
+static int binder_ioctl_get_node_debug_info(struct binder_proc *proc,
+				struct binder_node_debug_info *info) {
+	struct rb_node *n;
+	binder_uintptr_t ptr = info->ptr;
 
-	for (i = 0; i < SEQ_BUCKETS; i++) {
-		u64 ts = binder_get_seq(&binder_active_threads[i]);
+	memset(info, 0, sizeof(*info));
 
-		thread_seq = min(ts, thread_seq);
+	binder_inner_proc_lock(proc);
+	for (n = rb_first(&proc->nodes); n != NULL; n = rb_next(n)) {
+		struct binder_node *node = rb_entry(n, struct binder_node,
+						    rb_node);
+		if (node->ptr > ptr) {
+			info->ptr = node->ptr;
+			info->cookie = node->cookie;
+			info->has_strong_ref = node->has_strong_ref;
+			info->has_weak_ref = node->has_weak_ref;
+			break;
+		}
 	}
-	return thread_seq;
-}
+	binder_inner_proc_unlock(proc);
 
-static void zombie_cleanup_check(struct binder_proc *proc)
-{
-	u64 thread_seq = binder_get_thread_seq();
-	u64 zombie_seq = binder_get_seq(&zombie_procs);
-
-	if (thread_seq > zombie_seq)
-		binder_defer_work(proc, BINDER_ZOMBIE_CLEANUP);
+	return 0;
 }
 
 static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
@@ -4914,6 +4916,24 @@ static long binder_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		if (put_user(BINDER_CURRENT_PROTOCOL_VERSION,
 			     &ver->protocol_version)) {
 			ret = -EINVAL;
+			goto err;
+		}
+		break;
+	}
+	case BINDER_GET_NODE_DEBUG_INFO: {
+		struct binder_node_debug_info info;
+
+		if (copy_from_user(&info, ubuf, sizeof(info))) {
+			ret = -EFAULT;
+			goto err;
+		}
+
+		ret = binder_ioctl_get_node_debug_info(proc, &info);
+		if (ret < 0)
+			goto err;
+
+		if (copy_to_user(ubuf, &info, sizeof(info))) {
+			ret = -EFAULT;
 			goto err;
 		}
 		break;
