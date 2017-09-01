@@ -3316,7 +3316,7 @@ static void binder_transaction(struct binder_proc *proc,
 			}
 			if (copy_from_user(sg_bufp,
 					   (const void __user *)(uintptr_t)
-					    bp->buffer, bp->length)) {
+					   bp->buffer, bp->length)) {
 				binder_user_error("%d:%d got transaction with invalid offsets ptr\n",
 						  proc->pid, thread->pid);
 				return_error_param = -EFAULT;
